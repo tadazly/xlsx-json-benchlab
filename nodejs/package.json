@@ -1,0 +1,13 @@
+{
+  "name": "excel2json-node",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "convert": "node excel2json.js"
+  },
+  "dependencies": {
+    "saxes": "^6.0.0",
+    "unzipper": "^0.12.3"
+  }
+}

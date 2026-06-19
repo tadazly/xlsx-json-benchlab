@@ -1,0 +1,27 @@
+# Root-level generated benchmark/conversion outputs.
+/*.json
+
+# Generated pressure tables and scratch files.
+/pressure-table/
+/tmp-pressure-test/
+/tmp-format-check/
+
+# Go build/test cache created inside the workspace.
+/.gocache/
+/.gomodcache/
+
+# Build artifacts.
+/*.exe
+/*.test
+
+# Node dependencies and logs.
+nodejs/node_modules/
+nodejs/npm-debug.log*
+nodejs/yarn-debug.log*
+nodejs/yarn-error.log*
+
+# OS/editor noise.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
