@@ -24,6 +24,11 @@
 - 字段顺序与表头顺序一致。
 - JSON 为 compact array，一行一个 object。
 - 转换结束后输出数据行数和耗时。
+- 输入可以是单个 `.xlsx` 文件，也可以是目录。
+- 当输入是目录时，会递归转换内部所有 `.xlsx` 文件。
+- 目录转换默认保留输入目录下的相对路径。
+- 使用扁平化参数时，所有 JSON 会输出到同一个目录；同名文件会自动追加 `_2`、`_3` 后缀。
+- 目录转换会并发处理，默认并发数按 CPU 逻辑核心数选择，也可以指定最高并发数。
 
 输出示例：
 
@@ -86,6 +91,24 @@ cmd/excel2json-fast
 go run ./cmd/excel2json-fast -input .\data.xlsx -output .\data-fast.json
 ```
 
+递归转换目录，保留相对路径：
+
+```powershell
+go run ./cmd/excel2json-fast -input .\excels -output .\json-out
+```
+
+递归转换目录，扁平化输出到同一个目录：
+
+```powershell
+go run ./cmd/excel2json-fast -input .\excels -output .\json-out -flat
+```
+
+限制最高并发数：
+
+```powershell
+go run ./cmd/excel2json-fast -input .\excels -output .\json-out -concurrency 4
+```
+
 ### Node.js 低内存流式版
 
 路径：
@@ -113,6 +136,36 @@ npm install
 
 ```powershell
 npm run convert -- --input ..\data.xlsx --output ..\data-node.json
+```
+
+递归转换目录，保留相对路径：
+
+```powershell
+npm run convert -- --input ..\excels --output ..\json-out
+```
+
+递归转换目录，扁平化输出到同一个目录：
+
+```powershell
+npm run convert -- --input ..\excels --output ..\json-out --flat
+```
+
+限制最高并发数：
+
+```powershell
+npm run convert -- --input ..\excels --output ..\json-out --concurrency 4
+```
+
+Node.js 参数同时支持等号写法：
+
+```powershell
+npm run convert -- --input=..\excels --output=..\json-out --flat=true --concurrency=4
+```
+
+如果你的 npm 版本会把 `--flat`、`--concurrency` 这类参数当成 npm config 吞掉，推荐直接运行脚本：
+
+```powershell
+node .\excel2json.js --input ..\..\table --output ..\..\json-node --flat --concurrency 4
 ```
 
 指定 sheet：
@@ -192,3 +245,33 @@ Get-FileHash .\100mb-fast.json, .\100mb-node.json -Algorithm SHA256
 - `fast`：默认高性能路径。
 - `safe`：通用 Excel 库兜底。
 - `verify`：抽样或全量双实现校验。
+
+### 快速比对输出
+
+项目内置了一个快速比对工具：
+
+```text
+cmd/compare-output
+```
+
+它可以比较两个文件，也可以递归比较两个目录。比较文件时会输出两边的文件大小和 MD5；比较目录时会按相对路径比对所有文件，输出左右文件数量、差异文件数量，以及每个差异文件的大小和 MD5。
+
+比较两个文件：
+
+```powershell
+go run ./cmd/compare-output .\talk-fast.json .\talk-node.json
+```
+
+比较两个目录：
+
+```powershell
+go run ./cmd/compare-output ..\json-fast ..\json-node
+```
+
+限制目录比对时的并发数：
+
+```powershell
+go run ./cmd/compare-output ..\json-fast ..\json-node -concurrency 8
+```
+
+完全一致时退出码为 `0`；存在差异时退出码为 `1`，方便接入脚本或 CI。

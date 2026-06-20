@@ -32,6 +32,10 @@
 - 输出必须是 UTF-8。
 - 中文文本不能出现 `�` replacement character。
 - 对同一个受支持的输入，Go fast 和 Node.js 输出应当逐字节一致。
+- 输入是目录时，需要递归转换所有 `.xlsx` 文件。
+- 目录输出默认保留相对路径。
+- 扁平化输出时，所有 JSON 写入同一目录；同名文件使用 `_2`、`_3` 后缀避免覆盖。
+- 批处理需要并发执行，默认并发数按 CPU 逻辑核心数，允许用户指定最高并发数。
 
 ## XLSX 解析模型
 
@@ -67,6 +71,9 @@ cmd/excel2json-fast/main.go
 关键函数：
 
 - `convertFast`：入口流程，打开 ZIP，定位 sheet，准备 writer。
+- `runConversions`：区分单文件和目录输入，调度并发批处理。
+- `collectDirectoryTasks`：递归收集 `.xlsx` 文件并生成输出路径。
+- `optimalConcurrency`：根据 CPU 逻辑核心数和用户上限计算并发数。
 - `parseSheets`：从 `workbook.xml` 读取 sheet 名称和 `r:id`。
 - `parseRelationships`：从 `workbook.xml.rels` 建立 id 到 target 的映射。
 - `parseSharedStrings`：读取 `sharedStrings.xml`。
@@ -123,6 +130,9 @@ nodejs/excel2json.js
 关键函数：
 
 - `convert`：入口流程，打开 ZIP，定位 worksheet，读取 shared strings。
+- `runConversions`：区分单文件和目录输入，调度并发批处理。
+- `collectDirectoryTasks`：递归收集 `.xlsx` 文件并生成输出路径。
+- `optimalConcurrency`：根据 CPU 逻辑核心数和用户上限计算并发数。
 - `readWorkbook`：解析 sheet 元数据和 relationships。
 - `readSharedStrings`：构建共享字符串表。
 - `streamWorksheetToJSON`：流式读取 worksheet 并写 JSON。
@@ -235,6 +245,10 @@ Node custom streaming:
 10. 支持 inlineStr、t="s" shared string、普通 <v>。
 11. 提供 10MB、50MB、100MB 压测和 SHA256 对齐验证。
 12. 明确说明不完整支持日期格式、公式、合并单元格、样式语义。
+13. 支持目录输入递归转换。
+14. 支持保留相对路径输出和扁平化输出。
+15. 支持按 CPU 逻辑核心数并发，并允许指定最高并发数。
+16. 输出每个文件的转换耗时和总耗时。
 ```
 
 ## 推荐生产形态

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { StringDecoder } from "node:string_decoder";
@@ -9,28 +10,114 @@ import { SaxesParser } from "saxes";
 const options = parseArgs(process.argv.slice(2));
 
 if (!options.input) {
-  console.error("missing input file: use --input data.xlsx [--output data.json] [--sheet Sheet1]");
+  console.error("missing input: use --input data.xlsx|dir [--output data.json|dir] [--sheet Sheet1] [--flat] [--concurrency N]");
   process.exit(1);
-}
-
-if (path.extname(options.input).toLowerCase() !== ".xlsx") {
-  console.error(`input must be an .xlsx file: ${options.input}`);
-  process.exit(1);
-}
-
-if (!options.output) {
-  options.output = defaultOutputPath(options.input);
 }
 
 const startedAt = performance.now();
 
 try {
-  const rowCount = await convert(options);
+  const results = await runConversions(options);
   const elapsedMs = performance.now() - startedAt;
-  console.log(`Converted ${rowCount} data rows to ${options.output} in ${formatDuration(elapsedMs)}`);
+  let failures = 0;
+  let totalRows = 0;
+
+  for (const result of results) {
+    if (result.error) {
+      failures += 1;
+      console.log(`FAILED ${result.input} -> ${result.output} in ${formatDuration(result.elapsedMs)}: ${result.error.message}`);
+      continue;
+    }
+    totalRows += result.rows;
+    console.log(`Converted ${result.rows} data rows: ${result.input} -> ${result.output} in ${formatDuration(result.elapsedMs)}`);
+  }
+
+  console.log(`Finished ${results.length} file(s), ${failures} failed, ${totalRows} total data rows in ${formatDuration(elapsedMs)}`);
+  if (failures > 0) {
+    process.exit(1);
+  }
 } catch (error) {
   console.error(error instanceof Error ? error.stack || error.message : error);
   process.exit(1);
+}
+
+async function runConversions(options) {
+  const inputStat = fs.statSync(options.input);
+
+  if (!inputStat.isDirectory()) {
+    if (path.extname(options.input).toLowerCase() !== ".xlsx") {
+      throw new Error(`input must be an .xlsx file: ${options.input}`);
+    }
+
+    const output = resolveSingleOutput(options.input, options.output);
+    const startedAt = performance.now();
+    try {
+      const rows = await convert({
+        input: options.input,
+        output,
+        sheet: options.sheet
+      });
+      return [{
+        input: options.input,
+        output,
+        rows,
+        elapsedMs: performance.now() - startedAt
+      }];
+    } catch (error) {
+      return [{
+        input: options.input,
+        output,
+        rows: 0,
+        elapsedMs: performance.now() - startedAt,
+        error
+      }];
+    }
+  }
+
+  const tasks = collectDirectoryTasks(options.input, options.output || options.input, options.flat);
+  if (tasks.length === 0) {
+    throw new Error(`no .xlsx files found under ${options.input}`);
+  }
+
+  const concurrency = optimalConcurrency(options.concurrency, tasks.length);
+  console.log(`Discovered ${tasks.length} .xlsx file(s), concurrency=${concurrency}, flat=${Boolean(options.flat)}, output=${options.output || options.input}`);
+
+  const results = [];
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < tasks.length) {
+      const task = tasks[cursor];
+      cursor += 1;
+
+      const startedAt = performance.now();
+      try {
+        const rows = await convert({
+          input: task.input,
+          output: task.output,
+          sheet: options.sheet
+        });
+        results.push({
+          input: task.input,
+          output: task.output,
+          rows,
+          elapsedMs: performance.now() - startedAt
+        });
+      } catch (error) {
+        results.push({
+          input: task.input,
+          output: task.output,
+          rows: 0,
+          elapsedMs: performance.now() - startedAt,
+          error
+        });
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  results.sort((left, right) => left.input.localeCompare(right.input));
+  return results;
 }
 
 async function convert({ input, output, sheet }) {
@@ -56,6 +143,77 @@ async function convert({ input, output, sheet }) {
   const sharedStrings = sharedStringsEntry ? await readSharedStrings(sharedStringsEntry) : [];
 
   return streamWorksheetToJSON(sheetEntry, sharedStrings, output);
+}
+
+function resolveSingleOutput(input, output) {
+  if (!output) {
+    return defaultOutputPath(input);
+  }
+  if (fs.existsSync(output) && fs.statSync(output).isDirectory()) {
+    return path.join(output, defaultOutputPath(path.basename(input)));
+  }
+  return output;
+}
+
+function collectDirectoryTasks(inputDir, outputDir, flat) {
+  const inputs = [];
+  walkExcelFiles(inputDir, inputs);
+  inputs.sort((left, right) => left.localeCompare(right));
+
+  const usedFlatNames = new Map();
+  return inputs.map((input) => {
+    const relative = path.relative(inputDir, input);
+    const output = flat
+      ? path.join(outputDir, uniqueFlatOutputName(defaultOutputPath(path.basename(input)), usedFlatNames))
+      : path.join(outputDir, defaultOutputPath(relative));
+
+    return { input, output };
+  });
+}
+
+function walkExcelFiles(dir, files) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walkExcelFiles(fullPath, files);
+    } else if (isExcelFile(fullPath)) {
+      files.push(fullPath);
+    }
+  }
+}
+
+function isExcelFile(filePath) {
+  const name = path.basename(filePath);
+  return path.extname(name).toLowerCase() === ".xlsx" && !name.startsWith("~$");
+}
+
+function uniqueFlatOutputName(name, used) {
+  const count = used.get(name) ?? 0;
+  used.set(name, count + 1);
+  if (count === 0) {
+    return name;
+  }
+
+  const ext = path.extname(name);
+  const base = name.slice(0, name.length - ext.length);
+  return `${base}_${count + 1}${ext}`;
+}
+
+function optimalConcurrency(maxConcurrency, taskCount) {
+  let concurrency = typeof os.availableParallelism === "function"
+    ? os.availableParallelism()
+    : os.cpus().length;
+
+  if (Number.isInteger(maxConcurrency) && maxConcurrency > 0 && maxConcurrency < concurrency) {
+    concurrency = maxConcurrency;
+  }
+  if (concurrency < 1) {
+    concurrency = 1;
+  }
+  if (taskCount > 0 && concurrency > taskCount) {
+    concurrency = taskCount;
+  }
+  return concurrency;
 }
 
 async function readWorkbook(entries) {
@@ -401,27 +559,113 @@ function writeChunk(writer, chunk) {
 
 function parseArgs(args) {
   const parsed = {};
+  const positional = [];
 
   for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
+    let arg = args[index];
     const next = args[index + 1];
+    let inlineValue;
 
-    if (arg === "--input" || arg === "-i") {
-      parsed.input = next;
-      index += 1;
-    } else if (arg === "--output" || arg === "-o") {
-      parsed.output = next;
-      index += 1;
-    } else if (arg === "--sheet" || arg === "-s") {
-      parsed.sheet = next;
-      index += 1;
-    } else if (!parsed.input) {
-      parsed.input = arg;
-    } else if (!parsed.output) {
-      parsed.output = arg;
+    if (arg.startsWith("--") && arg.includes("=")) {
+      const equalIndex = arg.indexOf("=");
+      inlineValue = arg.slice(equalIndex + 1);
+      arg = arg.slice(0, equalIndex);
+    } else if (arg.startsWith("-") && arg.includes("=")) {
+      const equalIndex = arg.indexOf("=");
+      inlineValue = arg.slice(equalIndex + 1);
+      arg = arg.slice(0, equalIndex);
+    }
+
+    if (arg === "--input" || arg === "-input" || arg === "-i") {
+      parsed.input = inlineValue ?? next;
+      if (inlineValue === undefined) {
+        index += 1;
+      }
+    } else if (arg === "--output" || arg === "-output" || arg === "-o") {
+      parsed.output = inlineValue ?? next;
+      if (inlineValue === undefined) {
+        index += 1;
+      }
+    } else if (arg === "--sheet" || arg === "-sheet" || arg === "-s") {
+      parsed.sheet = inlineValue ?? next;
+      if (inlineValue === undefined) {
+        index += 1;
+      }
+    } else if (arg === "--flat" || arg === "-flat") {
+      if (inlineValue !== undefined) {
+        parsed.flat = parseBoolean(inlineValue);
+      } else if (next !== undefined && !next.startsWith("-") && isBooleanText(next)) {
+        parsed.flat = parseBoolean(next);
+        index += 1;
+      } else {
+        parsed.flat = true;
+      }
+    } else if (arg === "--concurrency" || arg === "-concurrency" || arg === "-j") {
+      parsed.concurrency = parsePositiveInteger(inlineValue ?? next, "concurrency");
+      if (inlineValue === undefined) {
+        index += 1;
+      }
+    } else if (!arg.startsWith("-")) {
+      positional.push(arg);
     }
   }
 
+  if (!parsed.input && positional.length > 0) {
+    parsed.input = positional.shift();
+  }
+  if (!parsed.output && positional.length > 0) {
+    parsed.output = positional.shift();
+  }
+  if (parsed.concurrency === undefined && positional.length > 0 && /^\d+$/.test(positional[0])) {
+    parsed.concurrency = parsePositiveInteger(positional.shift(), "concurrency");
+  }
+
+  applyNpmConfigFallbacks(parsed);
+  return parsed;
+}
+
+function applyNpmConfigFallbacks(parsed) {
+  const env = process.env;
+
+  if (!parsed.input && env.npm_config_input) {
+    parsed.input = env.npm_config_input;
+  }
+  if (!parsed.output && env.npm_config_output) {
+    parsed.output = env.npm_config_output;
+  }
+  if (!parsed.sheet && env.npm_config_sheet) {
+    parsed.sheet = env.npm_config_sheet;
+  }
+  if (parsed.flat === undefined && env.npm_config_flat !== undefined) {
+    parsed.flat = env.npm_config_flat === "" ? true : parseBoolean(env.npm_config_flat);
+  }
+  if (parsed.concurrency === undefined && env.npm_config_concurrency) {
+    parsed.concurrency = parsePositiveInteger(env.npm_config_concurrency, "concurrency");
+  }
+  if (parsed.concurrency === undefined && env.npm_config_j) {
+    parsed.concurrency = parsePositiveInteger(env.npm_config_j, "concurrency");
+  }
+}
+
+function isBooleanText(value) {
+  return /^(true|false|1|0|yes|no)$/i.test(value);
+}
+
+function parseBoolean(value) {
+  if (/^(true|1|yes)$/i.test(value)) {
+    return true;
+  }
+  if (/^(false|0|no)$/i.test(value)) {
+    return false;
+  }
+  throw new Error(`invalid boolean value: ${value}`);
+}
+
+function parsePositiveInteger(value, name) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer: ${value}`);
+  }
   return parsed;
 }
 

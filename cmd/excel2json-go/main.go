@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -177,7 +176,7 @@ func selectHeaderColumns(row []string) []headerColumn {
 		columns = append(columns, headerColumn{
 			index:        index,
 			header:       header,
-			quotedHeader: strconv.Quote(header),
+			quotedHeader: string(appendJSONString(nil, header)),
 		})
 	}
 
@@ -208,7 +207,7 @@ func writeJSONObject(writer *bufio.Writer, columns []headerColumn, row []string,
 		if column.index < len(row) {
 			value = row[column.index]
 		}
-		buffer = strconv.AppendQuote(buffer, value)
+		buffer = appendJSONString(buffer, value)
 	}
 	buffer = append(buffer, '}')
 
@@ -219,4 +218,44 @@ func writeJSONObject(writer *bufio.Writer, columns []headerColumn, row []string,
 func defaultOutputPath(inputPath string) string {
 	extension := filepath.Ext(inputPath)
 	return strings.TrimSuffix(inputPath, extension) + ".json"
+}
+
+func appendJSONString(buffer []byte, value string) []byte {
+	buffer = append(buffer, '"')
+	start := 0
+	for index := 0; index < len(value); index++ {
+		var escaped string
+		switch value[index] {
+		case '\\':
+			escaped = `\\`
+		case '"':
+			escaped = `\"`
+		case '\b':
+			escaped = `\b`
+		case '\f':
+			escaped = `\f`
+		case '\n':
+			escaped = `\n`
+		case '\r':
+			escaped = `\r`
+		case '\t':
+			escaped = `\t`
+		default:
+			if value[index] < 0x20 {
+				buffer = append(buffer, value[start:index]...)
+				buffer = append(buffer, `\u00`...)
+				const hex = "0123456789abcdef"
+				buffer = append(buffer, hex[value[index]>>4], hex[value[index]&0x0f])
+				start = index + 1
+			}
+			continue
+		}
+
+		buffer = append(buffer, value[start:index]...)
+		buffer = append(buffer, escaped...)
+		start = index + 1
+	}
+	buffer = append(buffer, value[start:]...)
+	buffer = append(buffer, '"')
+	return buffer
 }

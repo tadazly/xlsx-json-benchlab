@@ -5,6 +5,8 @@
 /pressure-table/
 /tmp-pressure-test/
 /tmp-format-check/
+/tmp-batch-*/
+/tmp-npm-args/
 
 # Go build/test cache created inside the workspace.
 /.gocache/

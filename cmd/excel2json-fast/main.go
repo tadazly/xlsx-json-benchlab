@@ -12,15 +12,21 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 func main() {
-	input := flag.String("input", "", "input .xlsx file")
-	output := flag.String("output", "", "output .json file")
+	input := flag.String("input", "", "input .xlsx file or directory")
+	output := flag.String("output", "", "output .json file or directory")
 	sheet := flag.String("sheet", "", "sheet name, defaults to the first sheet")
+	flat := flag.Bool("flat", false, "when input is a directory, write all JSON files directly under the output directory")
+	maxConcurrency := flag.Int("concurrency", 0, "maximum concurrent conversions for directory input, defaults to logical CPU cores")
+	flag.IntVar(maxConcurrency, "j", 0, "shorthand for -concurrency")
 	flag.Parse()
 
 	if *input == "" && flag.NArg() > 0 {
@@ -30,19 +36,193 @@ func main() {
 		*output = flag.Arg(1)
 	}
 	if *input == "" {
-		log.Fatal("missing input file: use -input data.xlsx [-output data.json] [-sheet Sheet1]")
-	}
-	if *output == "" {
-		*output = defaultOutputPath(*input)
+		log.Fatal("missing input: use -input data.xlsx|dir [-output data.json|dir] [-sheet Sheet1] [-flat] [-concurrency N]")
 	}
 
 	start := time.Now()
-	rows, err := convertFast(*input, *output, *sheet)
+	results, err := runConversions(*input, *output, *sheet, *flat, *maxConcurrency)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("Converted %d data rows to %s in %s\n", rows, *output, time.Since(start).Round(time.Millisecond))
+	failures := 0
+	totalRows := 0
+	for _, result := range results {
+		if result.err != nil {
+			failures++
+			fmt.Printf("FAILED %s -> %s in %s: %v\n", result.input, result.output, result.elapsed.Round(time.Millisecond), result.err)
+			continue
+		}
+		totalRows += result.rows
+		fmt.Printf("Converted %d data rows: %s -> %s in %s\n", result.rows, result.input, result.output, result.elapsed.Round(time.Millisecond))
+	}
+
+	fmt.Printf("Finished %d file(s), %d failed, %d total data rows in %s\n", len(results), failures, totalRows, time.Since(start).Round(time.Millisecond))
+	if failures > 0 {
+		os.Exit(1)
+	}
+}
+
+type conversionTask struct {
+	input  string
+	output string
+}
+
+type conversionResult struct {
+	input   string
+	output  string
+	rows    int
+	elapsed time.Duration
+	err     error
+}
+
+func runConversions(inputPath, outputPath, sheetName string, flat bool, maxConcurrency int) ([]conversionResult, error) {
+	info, err := os.Stat(inputPath)
+	if err != nil {
+		return nil, fmt.Errorf("stat input: %w", err)
+	}
+
+	if !info.IsDir() {
+		output := outputPath
+		if output == "" {
+			output = defaultOutputPath(inputPath)
+		} else if outputInfo, err := os.Stat(output); err == nil && outputInfo.IsDir() {
+			output = filepath.Join(output, defaultOutputPath(filepath.Base(inputPath)))
+		}
+
+		start := time.Now()
+		rows, err := convertFast(inputPath, output, sheetName)
+		return []conversionResult{{
+			input:   inputPath,
+			output:  output,
+			rows:    rows,
+			elapsed: time.Since(start),
+			err:     err,
+		}}, nil
+	}
+
+	tasks, err := collectDirectoryTasks(inputPath, outputPath, flat)
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 {
+		return nil, fmt.Errorf("no .xlsx files found under %s", inputPath)
+	}
+
+	concurrency := optimalConcurrency(maxConcurrency, len(tasks))
+	fmt.Printf("Discovered %d .xlsx file(s), concurrency=%d\n", len(tasks), concurrency)
+
+	taskCh := make(chan conversionTask)
+	resultCh := make(chan conversionResult, len(tasks))
+
+	var wg sync.WaitGroup
+	for index := 0; index < concurrency; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range taskCh {
+				start := time.Now()
+				rows, err := convertFast(task.input, task.output, sheetName)
+				resultCh <- conversionResult{
+					input:   task.input,
+					output:  task.output,
+					rows:    rows,
+					elapsed: time.Since(start),
+					err:     err,
+				}
+			}
+		}()
+	}
+
+	go func() {
+		for _, task := range tasks {
+			taskCh <- task
+		}
+		close(taskCh)
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	results := make([]conversionResult, 0, len(tasks))
+	for result := range resultCh {
+		results = append(results, result)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].input < results[j].input
+	})
+	return results, nil
+}
+
+func collectDirectoryTasks(inputDir, outputDir string, flat bool) ([]conversionTask, error) {
+	if outputDir == "" {
+		outputDir = inputDir
+	}
+
+	var inputs []string
+	if err := filepath.WalkDir(inputDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if isExcelFile(path) {
+			inputs = append(inputs, path)
+		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("walk input directory: %w", err)
+	}
+	sort.Strings(inputs)
+
+	tasks := make([]conversionTask, 0, len(inputs))
+	usedFlatNames := make(map[string]int, len(inputs))
+	for _, input := range inputs {
+		relative, err := filepath.Rel(inputDir, input)
+		if err != nil {
+			return nil, fmt.Errorf("make relative path for %s: %w", input, err)
+		}
+
+		var output string
+		if flat {
+			output = filepath.Join(outputDir, uniqueFlatOutputName(defaultOutputPath(filepath.Base(input)), usedFlatNames))
+		} else {
+			output = filepath.Join(outputDir, defaultOutputPath(relative))
+		}
+		tasks = append(tasks, conversionTask{input: input, output: output})
+	}
+	return tasks, nil
+}
+
+func isExcelFile(path string) bool {
+	name := filepath.Base(path)
+	return strings.EqualFold(filepath.Ext(name), ".xlsx") && !strings.HasPrefix(name, "~$")
+}
+
+func uniqueFlatOutputName(name string, used map[string]int) string {
+	count := used[name]
+	used[name] = count + 1
+	if count == 0 {
+		return name
+	}
+
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	return fmt.Sprintf("%s_%d%s", base, count+1, ext)
+}
+
+func optimalConcurrency(maxConcurrency int, taskCount int) int {
+	concurrency := runtime.NumCPU()
+	if maxConcurrency > 0 && maxConcurrency < concurrency {
+		concurrency = maxConcurrency
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if taskCount > 0 && concurrency > taskCount {
+		concurrency = taskCount
+	}
+	return concurrency
 }
 
 func convertFast(inputPath, outputPath, sheetName string) (int, error) {
@@ -407,14 +587,6 @@ func parseRow(rowXML []byte, sharedStrings []string) []string {
 			break
 		}
 		cellTag := rowXML[cellStart : cellStart+cellOpenEnd+1]
-		cellContentStart := cellStart + cellOpenEnd + 1
-		cellClose := bytes.Index(rowXML[cellContentStart:], []byte("</c>"))
-		if cellClose < 0 {
-			break
-		}
-		cellContentEnd := cellContentStart + cellClose
-		cellContent := rowXML[cellContentStart:cellContentEnd]
-
 		index := cellRefToColumnIndex(attrValue(cellTag, "r"))
 		if index < 0 {
 			index = nextImplicitIndex
@@ -425,6 +597,20 @@ func parseRow(rowXML []byte, sharedStrings []string) []string {
 			values = append(values, make([]string, index-len(values)+1)...)
 		}
 
+		if isSelfClosingTag(cellTag) {
+			values[index] = ""
+			offset = cellStart + cellOpenEnd + 1
+			continue
+		}
+
+		cellContentStart := cellStart + cellOpenEnd + 1
+		cellClose := bytes.Index(rowXML[cellContentStart:], []byte("</c>"))
+		if cellClose < 0 {
+			break
+		}
+		cellContentEnd := cellContentStart + cellClose
+		cellContent := rowXML[cellContentStart:cellContentEnd]
+
 		values[index] = resolveCellValue(attrValue(cellTag, "t"), cellContent, sharedStrings)
 		offset = cellContentEnd + len("</c>")
 	}
@@ -432,6 +618,19 @@ func parseRow(rowXML []byte, sharedStrings []string) []string {
 	return values
 }
 
+func isSelfClosingTag(tag []byte) bool {
+	for index := len(tag) - 2; index >= 0; index-- {
+		switch tag[index] {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '/':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
 func resolveCellValue(cellType string, content []byte, sharedStrings []string) string {
 	switch cellType {
 	case "inlineStr":
@@ -468,7 +667,7 @@ func selectHeaderColumns(row []string) []headerColumn {
 		}
 		columns = append(columns, headerColumn{
 			index:        index,
-			quotedHeader: strconv.Quote(header),
+			quotedHeader: string(appendJSONString(nil, header)),
 		})
 	}
 
@@ -499,7 +698,7 @@ func writeJSONObject(writer *bufio.Writer, columns []headerColumn, row []string,
 		if column.index < len(row) {
 			value = row[column.index]
 		}
-		buffer = strconv.AppendQuote(buffer, value)
+		buffer = appendJSONString(buffer, value)
 	}
 	buffer = append(buffer, '}')
 
@@ -614,4 +813,44 @@ func normalizeZipPath(baseDir, target string) string {
 func defaultOutputPath(inputPath string) string {
 	extension := filepath.Ext(inputPath)
 	return strings.TrimSuffix(inputPath, extension) + ".json"
+}
+
+func appendJSONString(buffer []byte, value string) []byte {
+	buffer = append(buffer, '"')
+	start := 0
+	for index := 0; index < len(value); index++ {
+		var escaped string
+		switch value[index] {
+		case '\\':
+			escaped = `\\`
+		case '"':
+			escaped = `\"`
+		case '\b':
+			escaped = `\b`
+		case '\f':
+			escaped = `\f`
+		case '\n':
+			escaped = `\n`
+		case '\r':
+			escaped = `\r`
+		case '\t':
+			escaped = `\t`
+		default:
+			if value[index] < 0x20 {
+				buffer = append(buffer, value[start:index]...)
+				buffer = append(buffer, `\u00`...)
+				const hex = "0123456789abcdef"
+				buffer = append(buffer, hex[value[index]>>4], hex[value[index]&0x0f])
+				start = index + 1
+			}
+			continue
+		}
+
+		buffer = append(buffer, value[start:index]...)
+		buffer = append(buffer, escaped...)
+		start = index + 1
+	}
+	buffer = append(buffer, value[start:]...)
+	buffer = append(buffer, '"')
+	return buffer
 }
